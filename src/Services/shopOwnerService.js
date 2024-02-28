@@ -40,7 +40,7 @@ const addFlower = async (shopOwnerId, flowerData, file) => {
 
     // Remove the id field from flowerData if it exists
     const { id, ...flowerDataWithoutId } = flowerData;
-
+    flowerDataWithoutId.isDeleted = false;
     // Add the new flower to the "flowers" collection with the image URL
     const flowerRef = await addDoc(collection(db, "items"), flowerDataWithoutId);
     console.log("New flower added with ID:", flowerRef.id);
@@ -53,6 +53,37 @@ const addFlower = async (shopOwnerId, flowerData, file) => {
     console.log("Shop owner's inventory updated.");
   } catch (error) {
     console.error("Error adding flower: ", error);
+    throw error;
+  }
+};
+
+/**
+ * Saves the working days for a shop owner in Firestore.
+ * 
+ * @param {string} shopOwnerId The ID of the shop owner whose working days are being updated.
+ * @param {object} workingDays The working days object to save. Example format:
+ *                             {
+ *                               monday: true,
+ *                               tuesday: false,
+ *                               wednesday: true,
+ *                               // etc. for each day of the week
+ *                             }
+ */
+const saveWorkingDays = async (workingDays) => {
+  const auth = getAuth();
+  const user = auth.currentUser;
+  const shopOwnerId = user.uid;
+  try {
+    // Reference to the shop owner's document in Firestore
+    const shopOwnerRef = doc(db, "ShopOwners", shopOwnerId);
+
+    // Update the shop owner's document with the new working days
+    await updateDoc(shopOwnerRef, {
+      workingDays: workingDays
+    });
+    console.log("Shop owner's working days updated.");
+  } catch (error) {
+    console.error("Error updating working days: ", error);
     throw error;
   }
 };
@@ -96,6 +127,55 @@ const fetchInventoryForShopOwner = async () => {
       throw error; // Rethrow the error to be handled by the caller
     }
   };
+
+
+  const fetchBouquetOrders = async () => {
+    const auth = getAuth();
+    const user = auth.currentUser;
+  
+    if (!user) {
+      console.error("No authenticated user found.");
+      return [];
+    }
+  
+    const shopOwnerId = user.uid; // Assuming the shopOwnerId is the user's UID
+  
+    try {
+      // First, fetch the shopOwner document to get the borders array
+      const shopOwnerRef = doc(db, "ShopOwners", shopOwnerId);
+      const shopOwnerSnap = await getDoc(shopOwnerRef);
+  
+      if (!shopOwnerSnap.exists()) {
+        console.log("No such shopOwner document!");
+        return [];
+      }
+  
+      const shopOwnerData = shopOwnerSnap.data();
+      const bordersIds = shopOwnerData.borders || [];
+  
+      // Fetch orders based on bordersIds
+      const ordersPromises = bordersIds.map(async (orderId) => {
+        const orderRef = doc(db, "borders", orderId);
+        const orderSnap = await getDoc(orderRef);
+        return orderSnap.exists() ? { id: orderSnap.id, ...orderSnap.data() } : null;
+      });
+  
+      // Resolve all promises to get the orders
+      const orders = await Promise.all(ordersPromises);
+      const filteredOrders = orders.filter(order => order !== null); // Filter out any null values if order doesn't exist
+  
+      console.log("Fetched bouquet orders successfully:", filteredOrders);
+      return filteredOrders;
+    } catch (error) {
+      console.error("Error fetching bouquet orders:", error);
+      return [];
+    }
+  };
+
+
+
+
+
   /**
  * Fetches orders based on the order IDs in the shop owner's document.
  * @param {string} shopOwnerId - The ID of the shop owner to fetch orders for.
@@ -181,6 +261,27 @@ const fetchInventoryForShopOwner = async () => {
       throw error;
     }
   };
+
+  const postJobAd = async (jobAdData) => {
+    const auth = getAuth();
+    const user = auth.currentUser;
+    if (!user) {
+      console.error("No authenticated user found.");
+      return;
+    }
+    const shopOwnerId = user.uid;
+  
+  
+    const shopOwnerDocRef = doc(db, "ShopOwners", shopOwnerId);
+  
+    try {
+      await setDoc(shopOwnerDocRef, { jobAd: jobAdData }, { merge: true });
+      console.log("Job ad posted successfully.");
+    } catch (error) {
+      console.error("Error posting job ad:", error);
+    }
+  };
+
 
 /**
  * Fetches data for the current shop owner.
@@ -304,6 +405,51 @@ const updateOrderStatus = async (orderId) => {
   }
 };
 
+const updateBOrderStatus = async (orderId) => {
+  const auth = getAuth();
+  const user = auth.currentUser;
+  if (!user) {
+    console.error("No user authenticated.");
+    return;
+  }
+  const shopOwnerId = user.uid;
+
+  try {
+    const orderRef = doc(db, "borders", orderId);
+    const orderSnap = await getDoc(orderRef);
+
+    if (!orderSnap.exists()) {
+      console.error("No such document!");
+      return;
+    }
+
+    const orderData = orderSnap.data();
+    const currentStatus = orderData.status;
+
+ 
+    let newStatus = "";
+    switch (currentStatus) {
+      case "paid":
+        newStatus = "prepared";
+        break;
+      case "prepared":
+        newStatus = "delivered";
+        break;
+      default:
+        console.error("Order is in an unhandled status:", currentStatus);
+        return;
+    }
+
+    // Finally, update the order status
+    await updateDoc(orderRef, { status: newStatus });
+    console.log(`Order status updated to "${newStatus}" with ID: `, orderId);
+
+  } catch (error) {
+    console.error("Error updating order status and inventory: ", error);
+    throw error; // Rethrow or handle as needed
+  }
+};
+
  
 const giveCoupon = async (orderId, couponValue) => {
   try {
@@ -350,10 +496,12 @@ const giveCoupon = async (orderId, couponValue) => {
    */
   const deleteFlower = async (shopOwnerId, flowerId) => {
     try {
-      // Delete the flower from the "flowers" collection
+      // Soft delete the flower by setting "isDeleted" to true
       const flowerRef = doc(db, "items", flowerId);
-      await deleteDoc(flowerRef);
-      console.log("Flower deleted with ID:", flowerId);
+      await updateDoc(flowerRef, {
+        isDeleted: true
+      });
+      console.log("Flower marked as deleted with ID:", flowerId);
   
       // Ensure the shop owner's inventory array exists and is an array
       const shopOwnerRef = doc(db, "ShopOwners", shopOwnerId);
@@ -363,10 +511,12 @@ const giveCoupon = async (orderId, couponValue) => {
         const shopOwnerData = shopOwnerDoc.data();
         // Check if inventory exists and is an array
         if (Array.isArray(shopOwnerData.inventory)) {
+          // Optionally, remove the flower ID from the shop owner's inventory array
+          // if you don't want to keep track of soft-deleted items in the inventory
           await updateDoc(shopOwnerRef, {
             inventory: arrayRemove(flowerId)
           });
-          console.log("Flower removed from shop owner's inventory.");
+          console.log("Flower ID removed from shop owner's inventory.");
         } else {
           console.log("Inventory does not exist or is not an array, skipping removal.");
         }
@@ -374,7 +524,7 @@ const giveCoupon = async (orderId, couponValue) => {
         console.log("ShopOwner document does not exist.");
       }
     } catch (error) {
-      console.error("Error deleting flower: ", error);
+      console.error("Error marking flower as deleted: ", error);
       throw error;
     }
   };
@@ -399,16 +549,66 @@ const createShopOwner = async (shopOwnerData, file, uid) => {
 
     // Create a reference to the specific document in the "ShopOwners" collection
     const shopOwnerDocRef = doc(db, "ShopOwners", uid);
+    const workingDays = {
+      sunday: true,
+      monday: true,
+      tuesday: true,
+      wednesday: true,
+      thursday: true,
+      friday: true,
+      saturday: true,
+ 
+    };
+    const jobAd = {
+
+      title: '',
+      description: ''
+    };
 
     // Set the data for the new shop owner document with the specified UID
     await setDoc(shopOwnerDocRef, {
       ...shopOwnerData,
       storePhoto: imageUrl, // Include the image URL in the Firestore document
+      jobAd: jobAd,
+      workingDays: workingDays,
     });
 
     console.log("New shop owner added with ID:", uid);
   } catch (error) {
     console.error("Error creating shop owner: ", error);
+    throw error;
+  }
+};
+const updateShopOwnerImage = async ( file) => {
+  const auth = getAuth();
+  const user = auth.currentUser;
+  const uid = user.uid;
+
+  try {
+    let imageUrl = '';
+
+    // Check if a file was provided
+    if (file) {
+      // Define the storage reference
+      const imageRef = storageRef(storage, `shopOwners/${uid}/${file.name}`);
+      // Upload the file to Firebase Storage
+      const snapshot = await uploadBytes(imageRef, file);
+      // Get the download URL of the uploaded file
+      imageUrl = await getDownloadURL(snapshot.ref);
+    }
+
+    // Create a reference to the specific document in the "ShopOwners" collection
+    const shopOwnerDocRef = doc(db, "ShopOwners", uid);
+
+    // Update the document with the new image URL
+    await updateDoc(shopOwnerDocRef, {
+      storePhoto: imageUrl, // Update the storePhoto field with the new image URL
+    });
+
+    console.log("Shop owner image updated with URL:", imageUrl);
+    return imageUrl; // Return the new image URL for further use
+  } catch (error) {
+    console.error("Error updating shop owner image: ", error);
     throw error;
   }
 };
@@ -430,6 +630,39 @@ const updateShopOwnerData = async (updatedData) => {
     console.error("Error updating shop owner data: ", error);
     throw error; // Rethrow the error to be handled by the caller
   }
+  
 };
+const fetchApplications = async () => {
+  const auth = getAuth();
+  const user = auth.currentUser;
+  if (!user) {
+    console.error("No authenticated user found.");
+    return [];
+  }
+  const shopOwnerId = user.uid; // Assuming the shopOwnerId is the user's UID
+
+  try {
+    const applicationDocRef = doc(db, "Applications", shopOwnerId);
+    const docSnap = await getDoc(applicationDocRef);
+
+    if (docSnap.exists()) {
+      const data = docSnap.data();
+      // Assuming the applications are stored in an array field named 'applications'
+      const applications = data.applications || [];
+      console.log("Fetched applications successfully:", applications);
+      return applications.map((application, index) => ({
+        id: index, // Since applications are in an array, there's no unique ID; consider generating one if needed
+        ...application
+      }));
+    } else {
+      console.log("No applications found for this shop owner.");
+      return []; // Return an empty array if the document does not exist
+    }
+  } catch (error) {
+    console.error("Error fetching applications:", error);
+    return []; // Return an empty array in case of error
+  }
+};
+
   export { signInShopOwner,updateOrderStatus, addFlower, giveCoupon,fetchInventoryForShopOwner, fetchShopOwnerData, editFlower, deleteFlower,createShopOwner ,fetchOrdersWithFlowerDetails,
-    updateShopOwnerData};
+    updateShopOwnerData,saveWorkingDays,postJobAd,fetchApplications ,updateShopOwnerImage,fetchBouquetOrders,updateBOrderStatus}; // Add the new function to the export list
