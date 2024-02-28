@@ -1,13 +1,162 @@
 // clientService.js
 
-import { getAuth, signInWithEmailAndPassword } from "firebase/auth";
+import { getAuth, signInWithEmailAndPassword,signOut } from "firebase/auth";
 
-import { collection, getDocs, query, where ,setDoc} from "firebase/firestore";
+import { collection, getDocs, query, where ,setDoc, or} from "firebase/firestore";
+import { storage } from "./firebase"; // Assuming this is the correct path to your Firebase config
+import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
+
 import {db} from "./firebase";
 import { doc, getDoc,addDoc,updateDoc,arrayUnion } from "firebase/firestore";
-const fetchCustomerData = async () => {
+
+
+const RateShopOwner = async (order, rating) => {
   const auth = getAuth();
+  const user = auth.currentUser;
+
+
+  const shopOwnerId = order.storeOwnerId;
+
+if (!shopOwnerId) {
+  console.error("Shop Owner ID is undefined.");
+  return;
+}
+
+  if (!user) {
+    console.error("No authenticated user found.");
+    return;
+  }
+  const customerId = user.uid;
+
+
+  // Prepare the new rating object
+  const newRating = {
+    ...rating,
+    customerId,
+
+  };
+
+  // Correctly obtain a reference to the shop owner's document in the 'ratings' collection
+  const ratingDocRef = doc(db, "ratings", shopOwnerId);
+  
+  try {
+    // Check if the rating document for the shop owner exists
+    const docSnap = await getDoc(ratingDocRef);
+    if (docSnap.exists()) {
+      // If the document exists, update it with the new rating
+      await updateDoc(ratingDocRef, {
+        ratings: arrayUnion(newRating)
+      });
+    } else {
+      // If the document doesn't exist, create it with the new rating as the first item in the array
+      await setDoc(ratingDocRef, {
+        ratings: [newRating]
+      });
+    }
+    console.log("Rating added successfully.");
+  } catch (error) {
+    console.error("Error adding rating:", error);
+  }
+};
+
+
+
+const fetchCustomerOrders = async () => {
+  const auth = getAuth();
+  const user = auth.currentUser;
+
+  const clientId = user.uid;
+
+  try {
+    // Fetch the shop owner's document to get the order IDs
+    const docRef = doc(db, "Clients", clientId);
+    const docSnap = await getDoc(docRef);
+
+    if (!docSnap.exists()) {
+      throw new Error("No client found with the given ID.");
+    }
+
+    const CustomerData = docSnap.data();
+    const orderIds = CustomerData.orders; // Assuming 'orders' is the field with order IDs
+
+    if (!orderIds || orderIds.length === 0) {
+      return []; // Return an empty array if there are no orders
+    }
+
+    // Fetch each order by ID
+    const orderPromises = orderIds.map(orderId => getDoc(doc(db, "orders", orderId)));
+    const orderDocs = await Promise.all(orderPromises);
+    let couponApplied=false ;
+    // Map over each order document to construct order objects, including coupon details if available
+    const orders = await Promise.all(orderDocs.map(async (docSnap) => {
+      if (!docSnap.exists()) {
+        console.warn(`No data found for order ID: ${docSnap.id}`);
+        return null;
+      }
+
+      const orderData = docSnap.data();
+      const shopOwnerRef=orderData.storeOwnerId;
+      const shopOwnerSnap = await getDoc(doc(db, "ShopOwners", shopOwnerRef));
+      if (!shopOwnerSnap.exists()) {
+        console.warn(`No data found for shop owner ID: ${shopOwnerRef}`);
+        return null;
+      }
+      orderData.shopOwnerName = shopOwnerSnap.data().fullName;
+      orderData.shopPhone = shopOwnerSnap.data().storePhone; 
+      // Check for a couponId and fetch coupon details if present
+      let couponValue = 0; // Default to 0 if no coupon or if the coupon can't be found
+      if (orderData.couponId) {
+        const couponSnap = await getDoc(doc(db, "coupons", orderData.couponId));
+        if (couponSnap.exists()) {
+          // Assuming the coupon document has a field named 'value'
+          couponValue = couponSnap.data().value;
+          couponApplied = true;
+      }
+      }
+      
+      // Fetch flower details for each flower in the order's flowers array
+      const flowersWithDetails = await Promise.all(orderData.flowers.map(async (flower) => {
+        const flowerDocSnap = await getDoc(doc(db, "items", flower.id));
+        if (!flowerDocSnap.exists()) {
+          console.warn(`No data found for flower ID: ${flower.id}`);
+          return null;
+        }
+        // Combine the flower details with the quantity from the order
+        return { ...flowerDocSnap.data(), id: flowerDocSnap.id, quantity: flower.quantity };
+      }));
+
+      // Filter out any null values (for non-existent flowers)
+      const flowers = flowersWithDetails.filter(flower => flower !== null);
+      const sum = flowers.reduce((acc, flower) => acc + flower.price * flower.quantity, 0) - couponValue;
+      
+      // Fetch client data
+      const clientRef = doc(db, "Clients", orderData.customerId);
+      const clientSnap = await getDoc(clientRef);
+      const clientData = clientSnap.data();
+      orderData.client = clientData;
+
+      // Return the order object with flower details, quantities, and couponValue included
+      const applied= String(couponApplied);
+      console.log(orderData);
+      return { ...orderData, flowers, id: docSnap.id, totalCost :sum , couponApplied: applied};
+    }));
+
+    // Filter out any null values (non-existent orders)
+    return orders.filter(order => order !== null);
+  } catch (error) {
+    console.error("Error fetching orders with flower details, quantity, and coupon value: ", error);
+    throw error;
+  }
+};
+
+
+
+
+const fetchCustomerData = async () => {
+  const auth = await getAuth();
+  console.log(auth.currentUser);
   if (auth.currentUser) {
+ 
     const docRef = doc(db, "Clients", auth.currentUser.uid);
     const docSnap = await getDoc(docRef);
     if (docSnap.exists()) {
@@ -56,10 +205,30 @@ const fetchCustomerData = async () => {
         }
       }
 
+      const couponsColRef = collection(db, "coupons");
+
+      // Create a query against the collection for coupons matching the shopOwnerId and customerId
+      const couponsQuery = query(couponsColRef, 
+
+        where("customerId", "==", auth.currentUser.uid), 
+        where("isUsed", "==", false) // Only fetch coupons that haven't been used
+      );
+  
+      // Execute the query
+      const querySnapshot = await getDocs(couponsQuery);
+  
+      // Map the results to an array of coupon data
+      const coupons = querySnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+
+   
+
       return {
         ...clientData,
         orderHistory: [], // Replace 'orderHistory' with actual orders data
-        coupons: 3, // Example data
+        coupons: coupons, // Example data
         orderStatus: currentOrderData.orderStatus, // Order status of the current order
       };
     } else {
@@ -69,6 +238,8 @@ const fetchCustomerData = async () => {
   }
   return null;
 };
+
+
 /**
  * Fetches coupons for a specific shop owner and the current customer.
  * 
@@ -222,26 +393,94 @@ const fetchShopData = async (shopOwnerId) => {
 }
 
 /**
- * Signs in a user using email and password.
+ * Signs in a user using email and password and checks if the client exists in Firestore.
  * @param {string} email - User's email.
  * @param {string} password - User's password.
- * @returns {Promise} A promise that resolves to the user credential object.
+ * @returns {Promise} A promise that resolves to the user credential object if the client exists.
  */
- const signInClient = async (email, password) => {
-    const auth = getAuth();
-    return signInWithEmailAndPassword(auth, email, password);
-  };
-// Add other client-related functions here...
+const signInClient = async (email, password) => {
+  const auth = getAuth();
+  try {
+    // Sign in the user with email and password
+    const userCredential = await signInWithEmailAndPassword(auth, email, password);
+    
+    // Get a reference to the Firestore service
+
+    
+    // Assuming each client's document ID in the 'clients' collection is their user UID
+    const clientDocRef = doc(db, "Clients", userCredential.user.uid);
+    
+    // Check if the client's document exists
+    const docSnap = await getDoc(clientDocRef);
+    if (!docSnap.exists()) {
+      // If the document does not exist, sign the user out and throw an error
+      await signOut(auth);
+      throw new Error("Client does not exist in Firestore.");
+    }
+    
+    // If everything is okay, return the user credential
+    return userCredential;
+  } catch (error) {
+    // Handle errors, including sign in errors or Firestore errors
+    console.error("Error signing in or checking client in Firestore:", error);
+    throw error;
+  }
+};
+
+// Fetch shop owners and their ratings
 const fetchShopOwners = async () => {
   try {
+    // Reference to the 'ShopOwners' collection
     const shopOwnersRef = collection(db, "ShopOwners");
+    // Fetch all documents from the 'ShopOwners' collection
     const querySnapshot = await getDocs(shopOwnersRef);
-    return querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // Use Promise.all to fetch ratings for each shop owner in parallel
+    const shopOwnersWithRatings = await Promise.all(querySnapshot.docs.map(async (docSnapshot) => {
+      const shopOwnerData = { id: docSnapshot.id, ...docSnapshot.data() };
+
+      // Correctly reference the 'Ratings' document for the current shop owner
+      // Make sure "ratings" is the correct collection name, and it matches your database structure
+      const ratingsRef = doc(db, "ratings", shopOwnerData.id);
+
+      // Fetch the ratings document
+      const ratingsSnap = await getDoc(ratingsRef);
+      
+      // Check if the ratings document exists and add its data to the shop owner object
+      if (ratingsSnap.exists()) {
+        shopOwnerData.ratings = ratingsSnap.data();
+        for (const rating of shopOwnerData.ratings.ratings) {
+          const clientRef = doc(db, "Clients", rating.customerId);
+          const clientSnap = await getDoc(clientRef);
+          if (clientSnap.exists()) {
+            rating.customerName = clientSnap.data().firstName + " " + clientSnap.data().lastName;
+          }
+        }
+        
+
+
+      } else {
+        // Set a default ratings value if no ratings document exists
+        shopOwnerData.ratings = { average: 0, ratings:
+          [ { customerName: "No ratings yet", rating: 0, comment: "No ratings yet" } ] };
+      }
+      console.log(shopOwnerData);
+      // Calculate the average rating
+      if (shopOwnerData.ratings.ratings && shopOwnerData.ratings.ratings.length > 0) {
+        shopOwnerData.ratings.average = shopOwnerData.ratings.ratings.reduce((acc, curr) => acc + curr.rating, 0) / shopOwnerData.ratings.ratings.length;
+      }
+      return shopOwnerData;
+    }));
+
+    return shopOwnersWithRatings;
   } catch (error) {
     console.error("Error fetching shop owners: ", error);
     throw error;
   }
 };
+
+export default fetchShopOwners;
+
 /**
  * Creates a new order with given details.
  * @param {string} storeOwnerId - ID of the store owner.
@@ -308,7 +547,148 @@ const createOrder = async (storeOwnerId, flowerOrders, couponId = null) => {
     throw error;
   }
 };
+const postApplication = async (applicant, shopId) => {
+  try {
+    const applicationRef = doc(db, "Applications", shopId);
+    const docSnap = await getDoc(applicationRef);
 
+    if (docSnap.exists()) {
+      // If the document already exists, update it with the new application
+      await updateDoc(applicationRef, {
+        applications: arrayUnion(applicant)
+      });
+    } else {
+      // If the document does not exist, create it with the initial application
+      await setDoc(applicationRef, {
+        applications: [applicant]
+      });
+    }
+    console.log("Application submitted successfully with shopId as doc ID.");
+  } catch (error) {
+    console.error("Error submitting application:", error);
+  }
+};
+
+const updateClient = async (client) => {
+  const auth = getAuth();
+  const user = auth.currentUser;
+  const clientId = user.uid;
+  const clientRef = doc(db, "Clients", clientId);
+  try {
+    await updateDoc(clientRef, client);
+    console.log("Client updated successfully.");
+  } catch (error) {
+    console.error("Error updating client:", error);
+  }
+}
+const postFlowersToFirebase = async (flowers, wrapper, shopId, imageData) => {
+  const auth = getAuth();
+  const user = auth.currentUser;
+
+  if (!user) {
+    throw new Error("User not authenticated");
+  }
+
+  const customerId = user.uid;
+
+  try {
+    if (!Array.isArray(flowers) || flowers.length === 0) {
+      throw new Error("Invalid input for flowers");
+    }
+    if (!wrapper) {
+      throw new Error("Invalid input for wrapper");
+    }
+
+    // Convert base64 image data to Blob
+    const fetchResponse = await fetch(imageData);
+    const blob = await fetchResponse.blob();
+
+    // Upload the image to Firebase Storage
+    const imageRef = storageRef(storage, `orderImages/${shopId}/${new Date().toISOString()}.png`);
+    await uploadBytes(imageRef, blob);
+    const imageUrl = await getDownloadURL(imageRef);
+
+    // Prepare flower arrangement data with the cleaned values
+    const flowerArrangementData = {
+      customerId,
+      flowers,
+      wrapper,
+      createdAt: new Date(),
+      imageUrl, // Include the image URL in the document
+      status: "paid",
+      shopId
+    };
+
+    // Reference to the 'orders' collection
+    const flowerArrangementsRef = collection(db, "borders");
+    
+    // Add a new document with the flower arrangement data
+    const flowerArrangementRef = await addDoc(flowerArrangementsRef, flowerArrangementData);
+    console.log("New flower arrangement and wrapper posted with ID: ", flowerArrangementRef.id);
+
+    // Reference to the customer document
+    const customerRef = doc(db, "Clients", customerId); // Adjust "Customers" to your actual customers collection name
+
+    // Update the customer document to include the new order ID in the 'borders' array
+    await updateDoc(customerRef, {
+      borders: arrayUnion(flowerArrangementRef.id)
+    });
+
+    // Optionally, also update the shopOwner document as before
+    const shopOwnerRef = doc(db, "ShopOwners", shopId);
+    await updateDoc(shopOwnerRef, {
+      borders: arrayUnion(flowerArrangementRef.id)
+    });
+
+    return flowerArrangementRef;
+  } catch (error) {
+    console.error("Error posting flower arrangement and wrapper: ", error);
+    throw error;
+  }
+};
+
+const fetchBouquetOrders = async () => {
+  const auth = getAuth();
+  const user = auth.currentUser;
+
+  if (!user) {
+    console.error("No authenticated user found.");
+    return [];
+  }
+
+  const ClientId = user.uid; // Assuming the shopOwnerId is the user's UID
+
+  try {
+    // First, fetch the shopOwner document to get the borders array
+    const shopOwnerRef = doc(db, "Clients", ClientId);
+    const shopOwnerSnap = await getDoc(shopOwnerRef);
+
+    if (!shopOwnerSnap.exists()) {
+      console.log("No such shopOwner document!");
+      return [];
+    }
+
+    const shopOwnerData = shopOwnerSnap.data();
+    const bordersIds = shopOwnerData.borders || [];
+
+    // Fetch orders based on bordersIds
+    const ordersPromises = bordersIds.map(async (orderId) => {
+      const orderRef = doc(db, "borders", orderId);
+      const orderSnap = await getDoc(orderRef);
+      return orderSnap.exists() ? { id: orderSnap.id, ...orderSnap.data() } : null;
+    });
+
+    // Resolve all promises to get the orders
+    const orders = await Promise.all(ordersPromises);
+    const filteredOrders = orders.filter(order => order !== null); // Filter out any null values if order doesn't exist
+
+    console.log("Fetched bouquet orders successfully:", filteredOrders);
+    return filteredOrders;
+  } catch (error) {
+    console.error("Error fetching bouquet orders:", error);
+    return [];
+  }
+};
 
 export { 
   fetchFlowersForShopOwner,
@@ -320,5 +700,11 @@ export {
       fetchShopData ,
       fetchCustomerData,
       saveCreditCardToFirebase,
-      getCustomerCoupons
+      getCustomerCoupons,
+      fetchCustomerOrders,
+      RateShopOwner,
+      postApplication,
+      updateClient
+      , postFlowersToFirebase,
+      fetchBouquetOrders
     };
